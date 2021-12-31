@@ -24,7 +24,7 @@ class SupportPoint:
         self.id    = id
 
     def propagate_id(self):
-        '''Depth-first search algorithm to assign all connected pixels the same 
+        '''Depth-first search algorithm to assign all connected pixels the same
         id. At the end of the algorithm, all connected points will have the ID
         of the lowest connected neighbor'''
         isolated = True
@@ -46,6 +46,10 @@ class SupportPoint:
             return None
 
 class Contact:
+    MaxByte = 256
+    # Lookup table for quickly computing logarithms.
+    ln_lut = np.log(np.arange(MaxByte));
+
     def __init__(self, map, points, id):
         self.map = map
         self.data = np.zeros([self.map.height, self.map.width])
@@ -54,10 +58,8 @@ class Contact:
         self.sign = 0
         self.generate_map()
         self.calc_sign()
-        self.calc_moments()
-        self.do_fit()
-        self.calc_partition()
-    
+        self.calc_params()
+
     def generate_map(self):
         self.npoints = len(self.points)
         self.x = np.zeros(self.npoints, np.int32)
@@ -78,7 +80,7 @@ class Contact:
             self.hess_xy[i] = self.map.hess_xy[p.y, p.x]
             # TODO: Remove this
             self.data[p.y, p.x] = self.map.data[p.y, p.x]
-            
+
     def calc_sign(self):
         hm_max = np.amax(self.z)
         hm_min = np.amin(self.z)
@@ -87,104 +89,99 @@ class Contact:
         else:
             self.sign = -1
 
-    def init_moments(self):
-        self.z2       = 0;
-        self.z2x      = 0;
-        self.z2x2     = 0;
-        self.z2y      = 0;
-        self.z2y2     = 0;
-        self.z2x3     = 0;
-        self.z2xy     = 0;
-        self.z2xy2    = 0;
-        self.z2x4     = 0;
-        self.z2x2y    = 0;
-        self.z2x2y2   = 0;
-        self.z2y3     = 0;
-        self.z2y4     = 0;        
-        self.z2logz   = 0;
-        self.z2logzx  = 0;
-        self.z2logzx2 = 0;
-        self.z2logzy  = 0;
-        self.z2logzy2 = 0;
-
-    # TODO: Refactor for BLAS implementation
-    #       When ported applied to C-code this will allow for optimized
-    #       libraries which can make use of core vector extensions (e.g. AVX)
-    # TODO: Employ lookup tables for ln
+    # TODO: Try using CBLAS routines for ease of porting vector ops to
+    #       C.  When this is done the port C-code libCBLAS will allow for
+    #       optimized libraries to make use of CPU vector extensions (e.g. AVX)
     def calc_moments(self):
-        self.init_moments()
-        for p in self.points:
-            x = p.x
-            y = p.y
-            z = p.map.data[y, x]
-            if ((z * self.sign) <= 0):
-                continue
-            logz = math.log(z * self.sign)
-            z2   = math.pow(z, 2)
-            x2   = math.pow(x, 2)
-            x3   = math.pow(x, 3)
-            x4   = math.pow(x, 4)
-            y2   = math.pow(y, 2)
-            y3   = math.pow(y, 3)
-            y4   = math.pow(y, 4)
-            xy   = x * y
-            x2y  = x2 * y
-            xy2  = x * y2
-            x2y2 = x2 * y2
+        # For this routine consider all values as positive
+        # Real contacts and inverted "ghost" contacts are swapped as
+        # needed to have a mostly positive sign.
+        #
+        # Ignore zero values or values whose sign differs from most
+        # of the other points
+        z_unsigned  = self.z * self.sign
+        actpts = np.asarray(z_unsigned > 0)
+        x  = self.x[actpts]
+        y  = self.y[actpts]
+        z  = z_unsigned[actpts]
 
-            self.z2       += z2
-            self.z2x      += z2 * x
-            self.z2x2     += z2 * x2
-            self.z2x3     += z2 * x3
-            self.z2x4     += z2 * x4
-            self.z2y      += z2 * y
-            self.z2y2     += z2 * y2
-            self.z2y3     += z2 * y3
-            self.z2y4     += z2 * y4
-            self.z2xy     += z2 * xy
-            self.z2xy2    += z2 * xy2
-            self.z2x2y    += z2 * x2y
-            self.z2x2y2   += z2 * x2y2
-            self.z2logz   += z2 * logz
-            self.z2logzx  += z2 * logz * x
-            self.z2logzx2 += z2 * logz * x2
-            self.z2logzy  += z2 * logz * y
-            self.z2logzy2 += z2 * logz * y2
+        # various products over x & y, one value per support point
+        x2    = np.power(x, 2)
+        x3    = np.power(x, 3)
+        x4    = np.power(x, 4)
+        y2    = np.power(y, 2)
+        y3    = np.power(y, 3)
+        y4    = np.power(y, 4)
+        xy    = x * y
+        x2y   = x2 * y
+        xy2   = x * y2
+        x2y2  = x2 * y2
 
-    def build_matrix(self):
-        mat = np.ndarray((5, 5))
-        mat[0, 0]                         = self.z2
-        mat[1, 0] = mat[0, 1]             = self.z2x
-        mat[2, 0] = mat[1, 1] = mat[0, 2] = self.z2x2
-        mat[3, 0] = mat[0, 3]             = self.z2y
-        mat[4, 0] = mat[3, 3] = mat[0, 4] = self.z2y2
-        mat[2, 1] = mat[1, 2]             = self.z2x3
-        mat[3, 1] = mat[1, 3]             = self.z2xy
-        mat[4, 1] = mat[1, 4]             = self.z2xy2
-        mat[2, 2]                         = self.z2x4
-        mat[3, 2] = mat[2, 3]             = self.z2x2y
-        mat[4, 2] = mat[2, 4]             = self.z2x2y2
-        mat[4, 3] = mat[3, 4]             = self.z2y3
-        mat[4, 4]                         = self.z2y4
-        return mat
+        # weighting values: z^2 and z2 * log(z)
+        z2    = np.power(z, 2);
+        z2lnz = z2 * Contact.ln_lut[np.asarray(z, np.int8)]
 
-    def do_fit(self):
+        # Compute the moments here, taking
+        # dot-products of the vectors above.
+        moments = {};
+        moments["z2"]       = np.sum(z2)
+        moments["z2x"]      = z2 @ x
+        moments["z2x2"]     = z2 @ x2
+        moments["z2x3"]     = z2 @ x3
+        moments["z2x4"]     = z2 @ x4
+        moments["z2y"]      = z2 @ y
+        moments["z2y2"]     = z2 @ y2
+        moments["z2y3"]     = z2 @ y3
+        moments["z2y4"]     = z2 @ y4
+        moments["z2xy"]     = z2 @ xy
+        moments["z2xy2"]    = z2 @ xy2
+        moments["z2x2y"]    = z2 @ x2y
+        moments["z2x2y2"]   = z2 @ x2y2
+        moments["z2lnz"]    = np.sum(z2lnz)
+        moments["z2lnzx"]   = z2lnz @ x
+        moments["z2lnzx2"]  = z2lnz @ x2
+        moments["z2lnzy"]   = z2lnz @ y
+        moments["z2lnzy2"]  = z2lnz @ y2
+        return moments
+
+    def calc_params(self):
+        moments = self.calc_moments()
+
+        mat = np.zeros([5, 5])
+        mat[0, 0]                         = moments["z2"]
+        mat[1, 0] = mat[0, 1]             = moments["z2x"]
+        mat[2, 0] = mat[1, 1] = mat[0, 2] = moments["z2x2"]
+        mat[3, 0] = mat[0, 3]             = moments["z2y"]
+        mat[4, 0] = mat[3, 3] = mat[0, 4] = moments["z2y2"]
+        mat[2, 1] = mat[1, 2]             = moments["z2x3"]
+        mat[3, 1] = mat[1, 3]             = moments["z2xy"]
+        mat[4, 1] = mat[1, 4]             = moments["z2xy2"]
+        mat[2, 2]                         = moments["z2x4"]
+        mat[3, 2] = mat[2, 3]             = moments["z2x2y"]
+        mat[4, 2] = mat[2, 4]             = moments["z2x2y2"]
+        mat[4, 3] = mat[3, 4]             = moments["z2y3"]
+        mat[4, 4]                         = moments["z2y4"]
+
         vec = np.ndarray((5,))
-        vec[0] = self.z2logz
-        vec[1] = self.z2logzx
-        vec[2] = self.z2logzx2
-        vec[3] = self.z2logzy
-        vec[4] = self.z2logzy2
-        mat = self.build_matrix()
+        vec[0] = moments["z2lnz"]
+        vec[1] = moments["z2lnzx"]
+        vec[2] = moments["z2lnzx2"]
+        vec[3] = moments["z2lnzy"]
+        vec[4] = moments["z2lnzy2"]
+
         # TODO: Exception handling
-        mat_inv = numpy.linalg.inv(mat)
-        self.params = mat_inv @ vec
+        try:
+            mat_inv = numpy.linalg.inv(mat)
+            self.params = mat_inv @ vec
+        except numpy.linalg.LinAlgError:
+            print(mat)
+            self.params = []
 
     def model_val(self, x, y):
         poly =  self.params[0] + self.params[1] * x + self.params[2] * x * x;
         poly += self.params[3] * y + self.params[4] * y * y;
         return math.exp(poly) * self.sign
-    
+
     # Add data from this contact to a combined map
     def update_map(self, data, type="id"):
         for i in range(0, self.npoints):
@@ -227,12 +224,12 @@ class Contact:
         pos_found = False
         neg_found = False
         for i in range(0, self.npoints):
-            if (self.partition_m[i] < 0): 
+            if (self.partition_m[i] < 0):
                 neg_found = neg_found or (self.curvature[i] > 0)
-            if (self.partition_m[i] > 0): 
+            if (self.partition_m[i] > 0):
                 pos_found = pos_found or (self.curvature[i] > 0)
         return neg_found and pos_found
-            
+
 class HeatMap:
     def __init__(self, d):
         '''Takes in a dictionary with keys "height", "width" and "data"'''
@@ -256,7 +253,7 @@ class HeatMap:
             return True
         if (not accept_surrounded):
             return False
-        
+
         # To determine if a pixel is surrounded by non-zero points look
         # at the values of the neigboring points.
         score = 0
@@ -298,7 +295,7 @@ class HeatMap:
         current_id = -1
         self.contacts = []
         #
-        # Break the overall support list into 
+        # Break the overall support list into
         #
         # Support points are assigned ids based on the order they are found
         #
@@ -310,7 +307,10 @@ class HeatMap:
             neighborhood = s.propagate_id()
             if(neighborhood != None):
                 neighborhood.append(s)
-                self.contacts.append(Contact(self, neighborhood, contact_id))
+                c = Contact(self, neighborhood, contact_id)
+                if (len(c.params) == 0):
+                    print("Failed to analyze contact {}".format(contact_id))
+                self.contacts.append(c)
                 contact_id += 1;
 
     def calc_curvature(self):
@@ -330,7 +330,7 @@ class HeatMap:
         self.lambda_m     = (self.hess_sum - self.discriminant)/2
         self.lambda_p     = (self.hess_sum + self.discriminant)/2
 
-        
+
     def plot(self, mode = "data"):
         fig, ax = plt.subplots()
         if (mode == "data"):
@@ -343,6 +343,10 @@ class HeatMap:
             map = np.zeros([self.height, self.width])
             for c in self.contacts:
                 map = c.update_map(map, type="id")
+        elif (mode == "model"):
+            map = np.zeros([self.height, self.width])
+            for c in self.contacts:
+                map = c.update_map(map, type="model")
         elif (mode == "curvature"):
             map = self.curvature
         elif (mode == "curvxdata"):
@@ -370,8 +374,12 @@ def load_yaml_data(filepath, RawOnly=False):
         raw=yaml.load(f, Loader=yaml.CSafeLoader)
     if (RawOnly):
         return None, raw
-    for d in raw["heatmaps"]:
-        hm = HeatMap(d)
+    for i in range(len(raw["heatmaps"])):
+        d = raw["heatmaps"][i]
+        try:
+            hm = HeatMap(d)
+        except Exception:
+            print("Failed to completely analyse frame {}".format(i))
         result.append(hm)
     return result, raw
 
@@ -381,21 +389,17 @@ def play_heatmaps(heatmaps, frames=(-1,-1), delta_t=0.1):
     hm_min = np.amin(heatmaps[0].data)
     hm_max = np.amax(heatmaps[0].data)
 
-    print(frames[0])
-    
     if (frames[0] < 0):
         frame_range = range(0, len(heatmaps))
     else:
         frame_range = range(frames[0], frames[1])
 
-    print(frame_range)
-    
     for i in frame_range:
-        hm_min = min(hm_min, np.amin(heatmaps[i].data)); 
+        hm_min = min(hm_min, np.amin(heatmaps[i].data));
         hm_max = max(hm_min, np.amax(heatmaps[i].data));
 
     hm_range = max(abs(hm_min), abs(hm_max))
-        
+
     for i in frame_range:
         ax.cla()
         ax.imshow(heatmaps[i].data, vmin=-hm_range, vmax=hm_range,
