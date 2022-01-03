@@ -1,4 +1,4 @@
-# Copyright Martin Lueker-Boden
+# Copyright 2021 Martin Lueker-Boden
 # Licensed under the Apache License, Version 2.0, see LICENSE for details.
 # SPDX-License-Identifier: Apache-2.0
 
@@ -11,44 +11,14 @@ import scipy.stats as stats
 import scipy.signal as signal
 import math
 
-class SupportPoint:
-    def __init__(self, heatmap, x, y, id):
-        '''heatmap: a HeatMap Object'''
-        self.map   = heatmap
-        self.x     = x
-        self.y     = y
-        self.above = None
-        self.below = None
-        self.left  = None
-        self.right = None
-        self.id    = id
+from config import *
 
-    def propagate_id(self):
-        '''Depth-first search algorithm to assign all connected pixels the same
-        id. At the end of the algorithm, all connected points will have the ID
-        of the lowest connected neighbor'''
-        isolated = True
-        neighborhood = []
-        self.map.stack_depth += 1
-        for neighbor in [self.above, self.below, self.left, self.right]:
-            if (neighbor != None):
-                isolated = False
-                if(neighbor.id > self.id):
-                    neighbor.id = self.id
-                    unclaimed_neighbors = neighbor.propagate_id()
-                    if (unclaimed_neighbors != None):
-                        neighborhood.extend(unclaimed_neighbors)
-                    neighborhood.append(neighbor)
-        self.map.stack_depth -= 1
-        if ( (len(neighborhood) > 0) or isolated):
-            return neighborhood
-        else:
-            return None
+Config.default_rel_curv_thresh = 0.0625
 
 class Contact:
     MaxByte = 256
     # Lookup table for quickly computing logarithms.
-    ln_lut = np.log(np.arange(MaxByte));
+    ln_lut = np.log(np.arange(1, MaxByte+1));
 
     def __init__(self, map, points, id):
         self.map = map
@@ -57,29 +27,33 @@ class Contact:
         self.id = id
         self.sign = 0
         self.generate_map()
+        self.calc_subcontacts()
         self.calc_sign()
         self.calc_params()
+        self.calc_partition()
 
     def generate_map(self):
         self.npoints = len(self.points)
         self.x = np.zeros(self.npoints, np.int32)
         self.y = np.zeros(self.npoints, np.int32)
         self.z = np.zeros(self.npoints)
+        self.curvdict = {}
         self.curvature = np.zeros(self.npoints)
         self.hess_xx = np.zeros(self.npoints)
         self.hess_yy = np.zeros(self.npoints)
         self.hess_xy = np.zeros(self.npoints)
         for i in range(0, self.npoints):
             p = self.points[i]
-            self.x[i] = p.x
-            self.y[i] = p.y
-            self.z[i] = self.map.data[p.y, p.x]
-            self.curvature[i] = self.map.curvature[p.y, p.x]
-            self.hess_xx[i] = self.map.hess_xx[p.y, p.x]
-            self.hess_yy[i] = self.map.hess_yy[p.y, p.x]
-            self.hess_xy[i] = self.map.hess_xy[p.y, p.x]
-            # TODO: Remove this
-            self.data[p.y, p.x] = self.map.data[p.y, p.x]
+            self.x[i] = p[0]
+            self.y[i] = p[1]
+            self.z[i] = self.map.data[p[1], p[0]]
+            self.curvature[i] = self.map.curvature[p[1], p[0]]
+            self.curvdict[p] = self.curvature[i]
+            # TODO: Remove these
+            self.hess_xx[i] = self.map.hess_xx[p[1], p[0]]
+            self.hess_yy[i] = self.map.hess_yy[p[1], p[0]]
+            self.hess_xy[i] = self.map.hess_xy[p[1], p[0]]
+            self.data[p[1], p[0]] = self.map.data[p[1], p[0]]
 
     def calc_sign(self):
         hm_max = np.amax(self.z)
@@ -198,13 +172,57 @@ class Contact:
                 data[self.y[i], self.x[i]] = self.partition_m[i]
         return data
 
+    def calc_subcontacts(self):
+        def is_unclaimed_peak(x, y, context):
+            hm = context[0]
+            threshold = context[1]
+            return hm.curvature[y, x] > threshold and hm.contact_id[y,x] < 0
+
+        def claim_peak(x, y, context):
+            hm = context[0]
+            id = context[2]
+            hm.contact_id[y, x] = id
+
+        self.contact_ids = []
+        self.peaks = []
+        self.contact_dict = {}
+        hm = self.map
+        threshold = np.amax(self.curvature * Config.default_rel_curv_thresh)
+        for (xi, yi) in zip(self.x, self.y):
+            peak = hm.propagate_contact(xi, yi, (hm, threshold, hm.num_contacts),
+                                        is_unclaimed_peak,
+                                        claim_peak, True)
+            if (len(peak) > 0):
+                # record the newly tagged peak both here and in the
+                # parent heatmap
+                hm.num_contacts += 1
+                self.contact_ids.append(hm.num_contacts)
+                self.contact_dict[hm.num_contacts] = len(self.peaks)
+                self.peaks.append(peak)
+
+    #
+    # Experimental function: Use Gauss's Theorema Egregium to calculate
+    # a line dividing two contacts.   The idea is that any saddle point
+    # (here the point where two touch contacts maximally overlap)
+    # will have negative curvature, and that the principal axes of curvature
+    # will define the bounary be two our two contact points.Using the (bad)
+    # hypothesis that this saddle point is the most negatively curved point
+    # on the surface the eigenvectors of the curvature matrix at this saddle
+    # will define the dividing line between two contacts
+    #
+    # Status: it works if you find the saddle point (which is pretty fun and
+    # all) but the saddle point is not the most negatively curved point on
+    # most surfaces.  It turns out that the outer skirt of a 2D gaussian is
+    # negatively curved all around, even for a single contact. So doesn't
+    # really seem to be a practical solution, as fun as it is.
+    #
     def calc_partition(self):
         idx = np.argmin(self.curvature)
         curv = self.curvature[idx]
-        hess_sum = self.hess_xx[idx] + self.hess_yy[idx]
-        discriminant = math.sqrt(hess_sum - 4 * curv)
-        lambda_p = (hess_sum + discriminant)/2
-        lambda_m = (hess_sum - discriminant)/2
+        hess_trace = self.hess_xx[idx] + self.hess_yy[idx]
+        discriminant = math.sqrt(hess_trace**2 - 4 * curv)
+        lambda_p = (hess_trace + discriminant)/2
+        lambda_m = (hess_trace - discriminant)/2
         # TODO: citation to eigenvector calculation
         normal_vp = (self.hess_xy[idx], lambda_p - self.hess_xx[idx])
         normal_vm = (self.hess_xy[idx], lambda_m - self.hess_xx[idx])
@@ -218,8 +236,10 @@ class Contact:
             self.partition_p[i] = d_p - offset_p
             self.partition_m[i] = d_m - offset_m
 
+    # Another experimental function related to the approach described in
+    # calc_partition above.
     # Returns True if the partition has regions of positive curvature on
-    # both sides
+    # both sides.
     def check_partition(self):
         pos_found = False
         neg_found = False
@@ -235,21 +255,25 @@ class HeatMap:
         '''Takes in a dictionary with keys "height", "width" and "data"'''
         self.width = d["width"]
         self.height = d["height"]
+        self.x = np.ones([self.height, 1]) * np.arange(self.width)
+        self.y = np.arange(self.height).reshape([self.height, 1]) *\
+                 np.ones([1, self.width])
+        self.support_id = -1 * np.ones([self.height, self.width], bool)
+        self.contact_id = -1 * np.ones([self.height, self.width], bool)
+        self.num_contacts = 0
         self.data = np.reshape(np.array(d["data"]), [self.height, self.width])
         mode = stats.mode(self.data, None)
         # Contact heatmaps can create negative swings
         # So the zero cannot be identified by taking the minimum
         self.data -= mode[0]
         self.calc_curvature()
-        self.identify_supports()
-        self.link_supports()
         self.identify_contacts()
 
     # TODO: accept_surrounded does not seem to be working
     def is_support_point(self, x, y, accept_surrounded=True):
         '''Returns true if point (x, y) is non-zero, (or is surrounded by non
            zero points)'''
-        if (self.data[y, x] != 0):
+        if (self.data[y, x] != 0 or self.curvature[y, x] != 0):
             return True
         if (not accept_surrounded):
             return False
@@ -263,32 +287,34 @@ class HeatMap:
         score += (y < (self.height -1)  and self.data[y+1, x] != 0)
         return (score == 4)
 
-    def identify_supports(self):
-        id = 0
-        self.supports = {}
-        self.support_list = []
-        for i in range(0, self.width):
-            for j in range(0, self.height):
-                if self.is_support_point(i, j):
-                    point = SupportPoint(self, i, j, id)
-                    self.supports[(j, i)] = point
-                    self.support_list.append(point)
-                    id += 1
+    def propagate_contact(self, x, y, context, accept_func, claim_func,
+                          include_diagonals):
+        '''Depth-first search algorithm to assign all connected pixels the same
+        id. At the end of the algorithm, all connected points will have the ID
+        of the lowest connected neighbor'''
+        neighborhood = []
+        if (not accept_func(x, y, context)):
+            return []
+        claim_func(x, y, context)
+        neighborhood.append((x, y))
 
-    def link_supports(self):
-        for s in self.support_list:
-        # link with support points above and to the left
-        # Note: This
-            i = s.x
-            j = s.y
-            if (i != 0 and (j, i - 1) in self.supports):
-                neighbor = self.supports[(j, i - 1)]
-                neighbor.left = s
-                s.right = neighbor
-            if (j != 0 and (j - 1, i) in self.supports):
-                neighbor = self.supports[(j - 1, i)]
-                s.above = neighbor
-                neighbor.below = s
+        immediate_neighbors = [(y, x + 1), (y, x - 1), (y + 1, x), (y - 1, x)]
+        if (include_diagonals):
+            immediate_neighbors.extend([(y + 1, x + 1), (y - 1, x + 1),
+                                        (y + 1, x - 1), (y - 1, x - 1)])
+
+        for yi, xi in immediate_neighbors:
+            if (xi < 0 or yi < 0 or xi >= self.width or yi >= self.height):
+                continue
+            else:
+                unclaimed_neighbors = self.propagate_contact(xi, yi,
+                                                             context,
+                                                             accept_func,
+                                                             claim_func,
+                                                             include_diagonals)
+                neighborhood.extend(unclaimed_neighbors)
+
+        return neighborhood
 
     def identify_contacts(self):
         self.stack_depth = 0
@@ -303,10 +329,24 @@ class HeatMap:
         # we can be sure that each partition of the support graph has
         # the id of the first point found.
         contact_id = 0
-        for s in self.support_list:
-            neighborhood = s.propagate_id()
-            if(neighborhood != None):
-                neighborhood.append(s)
+        in_contact_unclaimed = (
+            lambda x, y, context:
+            context[0].is_support_point(x, y) and context[0].support_id[y, x] < 0
+        )
+        def claim_point(x, y, context):
+            '''context: a heatmap/id tuple'''
+            hm = context[0]
+            id = context[1]
+            hm.support_id[y, x] = id
+
+        for x in np.arange(self.width):
+            for y in np.arange(self.height):
+                neighborhood = self.propagate_contact(x, y,
+                                                      (self, contact_id),
+                                                      in_contact_unclaimed,
+                                                      claim_point, False)
+                if(len(neighborhood) == 0):
+                    continue
                 c = Contact(self, neighborhood, contact_id)
                 if (len(c.params) == 0):
                     print("Failed to analyze contact {}".format(contact_id))
@@ -314,43 +354,55 @@ class HeatMap:
                 contact_id += 1;
 
     def calc_curvature(self):
-        sobel_xx = np.asarray([[1, -2, 1], [2, -4, 2], [1, -2, 1]], np.float32)
-        sobel_yy = np.asarray([[1, 2, 1], [-2, -4, -2], [1, 2, 1]], np.float32)
-        sobel_xy = np.asarray([[1, 0, -1], [0, 0, 0], [-1, 0, 1]], np.float32)
+        self.sobel_xx = np.asarray([[1, -2, 1], [2, -4, 2], [1, -2, 1]], np.float32)
+        self.sobel_yy = np.asarray([[1, 2, 1], [-2, -4, -2], [1, 2, 1]], np.float32)
+        self.sobel_xy = np.asarray([[1, 0, -1], [0, 0, 0], [-1, 0, 1]], np.float32)
 
-        self.hess_xx = signal.convolve2d(self.data, sobel_xx, mode="same")
-        self.hess_yy = signal.convolve2d(self.data, sobel_yy, mode="same")
-        self.hess_xy = signal.convolve2d(self.data, sobel_xy, mode="same")
+        self.hess_xx = signal.convolve2d(self.data, self.sobel_xx, mode="same")
+        self.hess_yy = signal.convolve2d(self.data, self.sobel_yy, mode="same")
+        self.hess_xy = signal.convolve2d(self.data, self.sobel_xy, mode="same")
 
         # The scalar (Gaussian) curvature is the determinant of the
         # hessian matrix
         self.curvature    = self.hess_xx * self.hess_yy - self.hess_xy**2
-        self.hess_sum     = self.hess_xx + self.hess_yy;
-        self.discriminant = np.sqrt(self.hess_sum**2 - 4 * self.curvature);
-        self.lambda_m     = (self.hess_sum - self.discriminant)/2
-        self.lambda_p     = (self.hess_sum + self.discriminant)/2
+        self.hess_trace   = self.hess_xx + self.hess_yy;
+        self.discriminant = np.sqrt(self.hess_trace**2 - 4 * self.curvature);
+        self.lambda_m     = (self.hess_trace - self.discriminant)/2
+        self.lambda_p     = (self.hess_trace + self.discriminant)/2
 
+    # experimental function: The curvature of the curvature.
+    # For a perfect gaussian curve this function should be flat,
+    # putting it here just as something else to look at.
+    def calc_hyper_curvature(self):
+        self.hyp_hess_xx = signal.convolve2d(self.curvature,\
+                                             self.sobel_xx, mode="same")
+        self.hyp_hess_yy = signal.convolve2d(self.curvature,\
+                                             self.sobel_yy, mode="same")
+        self.hyp_hess_xy = signal.convolve2d(self.curvature,\
+                                             self.sobel_xy, mode="same")
+        self.hyper_curvature    = (self.hyp_hess_xx * self.hyp_hess_yy
+                                   - self.hyp_hess_xy**2)
 
     def plot(self, mode = "data"):
         fig, ax = plt.subplots()
         if (mode == "data"):
             map = self.data
-        elif (mode == "support_idx"):
-            map = np.zeros([self.height, self.width])
-            for k, v in self.supports.items():
-                map[v.y, v.x] = v.id
-        elif (mode == "contact_idx"):
-            map = np.zeros([self.height, self.width])
-            for c in self.contacts:
-                map = c.update_map(map, type="id")
+        elif (mode == "support_id"):
+            map = self.support_id
+        elif (mode == "contact_id"):
+            map = self.contact_id
         elif (mode == "model"):
             map = np.zeros([self.height, self.width])
             for c in self.contacts:
                 map = c.update_map(map, type="model")
         elif (mode == "curvature"):
             map = self.curvature
-        elif (mode == "curvxdata"):
-            map = self.curvature * self.data
+        elif (mode == "hyper_curvature"):
+            idx = np.asarray(self.data!= 0)
+            map = self.hyper_curvature
+            map[idx] /= self.data.idx
+        elif (mode == "curvxdata2"):
+            map = self.curvature * self.data * self.data
         elif (mode == "partition_p"):
             map = np.zeros([self.height, self.width])
             for c in self.contacts:
@@ -366,7 +418,8 @@ class HeatMap:
         im = ax.imshow(map, vmin = -im_range, vmax = im_range,
                        cmap = plt.get_cmap('seismic'))
 
-        plt.show()
+        plt.pause(0.1)
+        return map
 
 def load_yaml_data(filepath, RawOnly=False):
     result = []
@@ -376,10 +429,7 @@ def load_yaml_data(filepath, RawOnly=False):
         return None, raw
     for i in range(len(raw["heatmaps"])):
         d = raw["heatmaps"][i]
-        try:
-            hm = HeatMap(d)
-        except Exception:
-            print("Failed to completely analyse frame {}".format(i))
+        hm = HeatMap(d)
         result.append(hm)
     return result, raw
 
