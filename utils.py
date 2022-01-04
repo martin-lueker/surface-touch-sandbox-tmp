@@ -170,6 +170,10 @@ class Contact:
                 data[self.y[i], self.x[i]] = self.partition_p[i]
             elif (type == "partition_m"):
                 data[self.y[i], self.x[i]] = self.partition_m[i]
+            elif (type == "closest"):
+                data[self.y[i], self.x[i]] = self.closest[i]
+            elif (type == "dist"):
+                data[self.y[i], self.x[i]] = self.dist[i]
         return data
 
     def calc_subcontacts(self):
@@ -183,10 +187,12 @@ class Contact:
             id = context[2]
             hm.contact_id[y, x] = id
 
-        self.contact_ids = []
+        contact_ids = []
         self.peaks = []
         self.contact_dict = {}
+        self.centroids = []
         hm = self.map
+        dists = []
         threshold = np.amax(self.curvature * Config.default_rel_curv_thresh)
         for (xi, yi) in zip(self.x, self.y):
             peak = hm.propagate_contact(xi, yi, (hm, threshold, hm.num_contacts),
@@ -196,10 +202,31 @@ class Contact:
                 # record the newly tagged peak both here and in the
                 # parent heatmap
                 hm.num_contacts += 1
-                self.contact_ids.append(hm.num_contacts)
+                contact_ids.append(hm.num_contacts)
                 self.contact_dict[hm.num_contacts] = len(self.peaks)
                 self.peaks.append(peak)
-
+                # compute the cenroid of the peak data:
+                cx, cy, cz = (0., 0., 0.)
+                n = 0
+                for xj, yj in peak:
+                    z = self.map.data[yj, xj]
+                    cx += xj * z
+                    cy += yj * z
+                    cz  += z
+                cx /= cz
+                cy /= cz
+                self.centroids.append((cx, cy))
+                dx = self.x - cx
+                dy = self.y - cy
+                dists.append(np.sqrt(np.power(dx, 2) + np.power(dy, 2)))
+                
+        npdists = np.asarray(dists)
+        self.contact_ids = np.asarray(contact_ids)
+        
+        # calculate which contact is closest to each point.
+        self.closest = self.contact_ids[np.argmin(npdists, 0)]
+        self.dist = np.amin(npdists, 0)
+        
     #
     # Experimental function: Use Euler's Theorem to calculate
     # a line dividing two contacts.   The idea is that any saddle point
@@ -411,6 +438,14 @@ class HeatMap:
             map = np.zeros([self.height, self.width])
             for c in self.contacts:
                 map = c.update_map(map, type="partition_m")
+        elif (mode == "closest"):
+            map = np.zeros([self.height, self.width])
+            for c in self.contacts:
+                map = c.update_map(map, type="closest")
+        elif (mode == "dist"):
+            map = np.zeros([self.height, self.width])
+            for c in self.contacts:
+                map = c.update_map(map, type="dist")
         im_min = np.amin(map)
         im_max = np.amax(map)
         im_range = max(abs(im_min), abs(im_max))
